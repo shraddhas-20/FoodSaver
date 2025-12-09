@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import sqlite3
 import hashlib
 import uuid
-import traceback
 import random
 from functools import wraps
 import requests
@@ -20,7 +19,9 @@ app.config['UPLOAD_FOLDER'] = 'static/uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Database configuration
-DATABASE = 'foodsaver.db'
+DATABASE = os.getenv('DATABASE_URL', 'foodsaver.db')
+if DATABASE.startswith('sqlite:///'):
+    DATABASE = DATABASE.replace('sqlite:///', '')
 
 # AI Configuration
 HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY', 'your-huggingface-api-key-here')
@@ -304,6 +305,96 @@ def profile():
 def contact():
     """Contact page for the Food Saver app"""
     return render_template('contact.html')
+
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    """Forgot password page - request password reset"""
+    if 'user_id' in session:
+        return redirect(url_for('dashboard'))
+    
+    if request.method == 'POST':
+        email = request.form.get('email')
+        
+        if email:
+            conn = get_db_connection()
+            user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+            conn.close()
+            
+            if user:
+                # Generate a simple reset token (in production, use more secure tokens)
+                reset_token = str(uuid.uuid4())
+                
+                # Store reset token in session (in production, store in database with expiry)
+                session[f'reset_token_{reset_token}'] = {
+                    'email': email,
+                    'user_id': user['id'],
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                # In production, send email. For now, show reset link directly
+                flash(f'Password reset requested for {email}. Use this link to reset your password.', 'info')
+                return redirect(url_for('reset_password', token=reset_token))
+            else:
+                # Don't reveal if email exists or not for security
+                flash('If an account with this email exists, you will receive password reset instructions.', 'info')
+        else:
+            flash('Please enter your email address.', 'error')
+    
+    return render_template('forgot_password.html')
+
+@app.route('/reset-password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    """Reset password with token"""
+    if 'user_id' in session:
+        return redirect(url_for('dashboard'))
+    
+    # Check if token exists and is valid
+    token_key = f'reset_token_{token}'
+    if token_key not in session:
+        flash('Invalid or expired reset token.', 'error')
+        return redirect(url_for('forgot_password'))
+    
+    token_data = session[token_key]
+    
+    # Check token age (expire after 1 hour)
+    token_time = datetime.fromisoformat(token_data['timestamp'])
+    if datetime.now() - token_time > timedelta(hours=1):
+        session.pop(token_key, None)
+        flash('Reset token has expired. Please request a new one.', 'error')
+        return redirect(url_for('forgot_password'))
+    
+    if request.method == 'POST':
+        password = request.form.get('password')
+        confirm_password = request.form.get('confirm_password')
+        
+        if password and confirm_password:
+            if len(password) < 6:
+                flash('Password must be at least 6 characters long.', 'error')
+            elif password == confirm_password:
+                try:
+                    # Update password in database
+                    conn = get_db_connection()
+                    conn.execute(
+                        'UPDATE users SET password_hash = ? WHERE id = ?',
+                        (hash_password(password), token_data['user_id'])
+                    )
+                    conn.commit()
+                    conn.close()
+                    
+                    # Clear the reset token
+                    session.pop(token_key, None)
+                    
+                    flash('Password successfully reset! You can now log in with your new password.', 'success')
+                    return redirect(url_for('login'))
+                    
+                except Exception as e:
+                    flash('Failed to reset password. Please try again.', 'error')
+            else:
+                flash('Passwords do not match.', 'error')
+        else:
+            flash('Please fill in all fields.', 'error')
+    
+    return render_template('reset_password.html', token=token, email=token_data['email'])
 
 # DELETE FUNCTIONALITY
 @app.route('/delete_food_item/<int:item_id>', methods=['DELETE', 'POST'])
@@ -963,14 +1054,6 @@ def add_item_to_pantry(item_data, user_id):
     except Exception:
         return None
 
-@app.route('/test')
-def test():
-    """Simple test route to check if server is working"""
-    return jsonify({
-        'success': True,
-        'message': 'Server is working!',
-        'timestamp': datetime.now().isoformat()
-    })
 
 @app.route('/chatbot')
 @login_required
@@ -1308,5 +1391,5 @@ def chat_message_api():
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5001))
-    debug = os.getenv('FLASK_ENV') != 'production'
+    debug = os.getenv('FLASK_ENV', 'development') == 'development'
     app.run(debug=debug, host='0.0.0.0', port=port)
